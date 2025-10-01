@@ -1,0 +1,91 @@
+name: GPU RDP Session
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gpu-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: ✅ Enable RDP Access
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
+          netsh advfirewall firewall add rule name="Allow RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService
+
+      - name: 👤 Create Admin User
+        run: |
+          $username = "gpuuser"
+          $password = "Admin@12345"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: 🌐 Install Tailscale
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: 🔌 Connect to Tailscale
+        run: |
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tsPath up --authkey ${{ secrets.TAILSCALE_AUTH_KEY }} --hostname gpu-runner-${{ github.run_id }}
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & $tsPath ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "❌ Failed to get Tailscale IP"
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: 🧪 Test RDP Port
+        run: |
+          Write-Host "Testing connection to $env:TAILSCALE_IP:3389"
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $result.TcpTestSucceeded) {
+              Write-Error "❌ RDP port not accessible"
+              exit 1
+          }
+          Write-Host "✅ RDP port is open!"
+
+      - name: 🎮 Check GPU Availability
+        run: |
+          Get-WmiObject win32_VideoController | Select-Object Name, DriverVersion, VideoProcessor
+
+      - name: 🟢 Keep Runner Alive
+        run: |
+          Write-Host "`n================ RDP Session Info ================"
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : $env:RDP_USERNAME"
+          Write-Host "Password     : $env:RDP_PASSWORD"
+          Write-Host "=================================================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] GPU Runner active - RDP ready"
+              Start-Sleep -Seconds 300
+          }
